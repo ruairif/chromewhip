@@ -1,5 +1,7 @@
 import asyncio
 import base64
+import collections
+import importlib
 import json
 import logging
 from typing import Optional
@@ -10,7 +12,8 @@ import websockets.protocol
 
 from chromewhip import helpers
 from chromewhip.base import SyncAdder
-from chromewhip.protocol import page, runtime, target, input, inspector, browser, accessibility
+from chromewhip.protocol import dom, emulation, page, runtime, target, input, inspector, browser, accessibility, target
+from chromewhip.render_image import ChromeImageRenderer
 
 TIMEOUT_S = 25
 MAX_PAYLOAD_SIZE_BYTES = 2 ** 23
@@ -34,7 +37,6 @@ class JSScriptError(ChromewhipException):
 
 
 class ChromeTab(metaclass=SyncAdder):
-
     def __init__(self, title, url, ws_uri, tab_id):
         self.id_ = tab_id
         self._title = title
@@ -42,6 +44,7 @@ class ChromeTab(metaclass=SyncAdder):
         self._ws_uri = ws_uri
         self.target_id = ws_uri.split('/')[-1]
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
+        self._frame_id = None
         self._message_id = 0
         self._current_task: Optional[asyncio.Task] = None
         self._ack_events = {}
@@ -49,6 +52,7 @@ class ChromeTab(metaclass=SyncAdder):
         self._input_events = {}
         self._trigger_events = {}
         self._event_payloads = {}
+        self._event_callbacks = collections.defaultdict(list)
         self._recv_task = None
         self._log = logging.getLogger('chromewhip.chrome.ChromeTab')
         self._send_log = logging.getLogger('chromewhip.chrome.ChromeTab.send_handler')
@@ -59,10 +63,8 @@ class ChromeTab(metaclass=SyncAdder):
         ws_url = json_.get('webSocketDebuggerUrl')
         if not ws_url:
             tab_id = json_['id']
-            ws_url = 'ws://{}:{}/devtools/page/{}'.format(host,
-                                                          port,
-                                                          tab_id)
-        t = cls(json_['title'], json_['url'],  ws_url, json_['id'])
+            ws_url = 'ws://{}:{}/devtools/page/{}'.format(host, port, tab_id)
+        t = cls(json_['title'], json_['url'], ws_url, json_['id'])
         await t.connect()
         return t
 
@@ -123,6 +125,11 @@ class ChromeTab(metaclass=SyncAdder):
                     if trigger_event:
                         self._recv_log.debug('trigger exists for hash "%s", alerting...' % hash_)
                         trigger_event.set()
+
+                    if result['method'] in self._event_callbacks:
+                        self._recv_log.debug('running callbacks for hash "%s", alerting...' % hash_)
+                        for callback in self._event_callbacks:
+                            callback(event)
                 else:
                     # TODO: deal with invalid state
                     self._recv_log.info('Invalid message %s, what do i do now?' % result)
@@ -228,7 +235,9 @@ class ChromeTab(metaclass=SyncAdder):
                     cleaned_hash_input_dict = {k: v for k, v in hash_input_dict.items() if k in trigger_event_cls.hashable}
                     hash_ = trigger_event_cls.build_hash(**cleaned_hash_input_dict)
                 except TypeError:
-                    raise TypeError(f'Event "{trigger_event_cls.js_name}" hash cannot be built with "{hash_input_dict}"')
+                    raise TypeError(
+                        'Event "{}" hash cannot be built with "{}"'.format(trigger_event_cls.js_name, hash_input_dict)
+                    )
                 event = self._event_payloads.get(hash_)
                 if not event:
                     self._send_log.debug('Waiting for event with hash "%s"...' % hash_)
@@ -273,28 +282,61 @@ class ChromeTab(metaclass=SyncAdder):
     def ws_uri(self):
         return self._ws_uri
 
-    async def enable_page_events(self):
-        return await self._send(*page.Page.enable())
+    @property
+    def viewport_size(self):
+        return self._viewport_size
 
-    async def send_command(self, command, input_event_type=None, await_on_event_type=None):
-        return await self._send(*command, input_event_cls=input_event_type, trigger_event_cls=await_on_event_type)
+    @property
+    def frame_id(self):
+        return self._frame_id
+
+    async def set_viewport(self, height, width):
+        height, width = int(float(height)), int(float(width))
+        self.send_command(
+            page.Page.setDeviceMetricsOverride(
+                width=width, height=height, deviceScaleFactor=0.0, mobile=False
+            )
+        )
+        self._viewport_size = width, height
+
+    async def enable(self, type, methods=None):
+        try:
+            module = globals()[type]
+        except KeyError:
+            module = importlib.import_module(
+                'chromewhip.protocol.{}'.format(type)
+            )
+            globals()[type] = module
+        if methods:
+            for event_name, callbacks in methods.items():
+                if not isinstance(callbacks, (list, tuple, set)):
+                    callbacks = [callbacks]
+                self._event_callbacks[event_name].extend(callbacks)
+        return await self._send(*getattr(module, type.title()).enable())
+
+    async def send_command(
+        self, command, input_event_type=None, await_on_event_type=None
+    ):
+        return await self._send(
+            *command,
+            input_event_cls=input_event_type,
+            trigger_event_cls=await_on_event_type,
+        )
 
     async def html(self):
         result = await self.evaluate('document.documentElement.outerHTML')
         value = result['ack']['result']['result'].value
-        return value.encode('utf-8')
-
-    async def screenshot(self):
-        result = await self.send_command(page.Page.captureScreenshot(format='png', fromSurface=False))
-        base64_data = result['ack']['result']['data']
-        return base64.b64decode(base64_data)
+        return value
 
     async def go(self, url):
         """
         Navigate the tab to the URL
         """
-        return await self.send_command(page.Page.navigate(url),
-                                       await_on_event_type=page.FrameStoppedLoadingEvent)
+        res = await self.send_command(
+            page.Page.navigate(url),
+            await_on_event_type=page.FrameStoppedLoadingEvent,
+        )
+        self._frame_id = res['ack']['result']['frameId']
 
     async def evaluate(self, javascript):
         """
@@ -305,9 +347,108 @@ class ChromeTab(metaclass=SyncAdder):
         if r.subtype == 'error':
             raise JSScriptError({
                 'reason': 'Runtime.evalulate threw an error',
-                'error': result["ack"]["result"]["exceptionDetails"].to_dict()
+                'error': result["ack"]["result"]["exceptionDetails"].to_dict(),
             })
         return result
+
+    async def _get_image(
+        self, image_format, width, height, render_all, scale_method, region
+    ):
+        old_size = self.viewport_size
+        try:
+            await self.send_command(
+                target.Target.activateTarget(self.target_id)
+            )
+            if render_all:
+                res = await self.send_command(page.Page.getLayoutMetrics())
+                size = res['ack']['result']['contentSize']
+                width = int(float(size.width))
+                height = int(float(size.height))
+                await self.set_viewport(height, width=width)
+                renderer = ChromeImageRenderer(
+                    self,
+                    self._log,
+                    image_format,
+                    width=width,
+                    height=height,
+                    scale_method=scale_method,
+                    region=region,
+                )
+                image = await renderer.render()
+        finally:
+            await self.set_viewport(*old_size)
+        return image
+
+    async def png(
+        self,
+        width=None,
+        height=None,
+        b64=False,
+        render_all=False,
+        scale_method=None,
+        region=None,
+    ):
+        """ Return screenshot in PNG format """
+        self._log.debug(
+            "Getting PNG: width=%s, height=%s, "
+            "render_all=%s, scale_method=%s, region=%s"
+            % (width, height, render_all, scale_method, region)
+        )
+        image = await self._get_image(
+            'PNG', width, height, render_all, scale_method, region=region
+        )
+        return image if b64 else base64.b64encode(image)
+
+    async def jpeg(
+        self,
+        width=None,
+        height=None,
+        b64=False,
+        render_all=False,
+        scale_method=None,
+        quality=None,
+        region=None,
+    ):
+        """ Return screenshot in JPEG format. """
+        self._log.debug(
+            "Getting JPEG: width=%s, height=%s, "
+            "render_all=%s, scale_method=%s, quality=%s, region=%s"
+            % (width, height, render_all, scale_method, quality, region)
+        )
+        image = await self._get_image(
+            'JPEG', width, height, render_all, scale_method, region=region
+        )
+        return image if b64 else base64.b64decode(image)
+
+    async def har(self, reset):
+        """ Return HAR information """
+        return self.har.to_dict()
+
+    async def har_reset(self):
+        """ Drop current HAR information """
+        self._log.debug("HAR information is reset")
+        return self.har.reset_har()
+
+    async def history(self):
+        """ Return history of 'main' HTTP requests """
+        res = await self.send_command(page.Page.getNavigationHistory())
+        return [
+            {'type': 'urlChanged', 'data': entry.url}
+            for entry in res['ack']['result']['entries']
+        ]
+
+    async def cookies(self):
+        """Return cookies for this page."""
+        res = await self.send_command(page.Page.getCookies())
+        return [vars(cookie) for cookie in res['ack']['result']['cookies']]
+
+    async def js_console(self):
+        messages = []
+        for name, event in self._event_payloads.items():
+            if not name.startswith('Log.entryAdded'):
+                continue
+            messages.append('[{source}][{level}] {text}'.format(**vars(event)))
+        return messages
 
     def __str__(self):
         return '%s - %s' % (self.title, self.url)
@@ -317,7 +458,6 @@ class ChromeTab(metaclass=SyncAdder):
 
 
 class Chrome(metaclass=SyncAdder):
-
     def __init__(self, host='localhost', port=9222):
         self._host = host
         self._port = port
@@ -349,7 +489,6 @@ class Chrome(metaclass=SyncAdder):
                 self._log.debug("Connected to Chrome! Found {} tabs".format(len(self._tabs)))
         self.is_connected = True
 
-
     @property
     def host(self):
         return self._host
@@ -380,5 +519,3 @@ class Chrome(metaclass=SyncAdder):
         await tab.disconnect()
         async with aiohttp.ClientSession() as session:
             await session.get(self._url + f'/json/close/{tab.id_}')
-
-

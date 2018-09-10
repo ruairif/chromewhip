@@ -10,7 +10,7 @@ class PayloadMixin:
     def build_send_payload(cls, method: str, params: dict):
         return {
             "method": ".".join([cls.__name__, method]),
-            "params": {k: v for k, v in params.items() if v is not None}
+            "params": {k: v for k, v in params.items() if v is not None},
         }
 
     @classmethod
@@ -26,18 +26,29 @@ class PayloadMixin:
                 try:
                     expected_ = types_.pop(name)
                     expected_type_ = expected_['class']
+                    many = False
+                    if isinstance(expected_type_, list):
+                        expected_type_ = expected_type_[0]
+                        many = True
                 except KeyError:
                     raise KeyError('name %s not in expected payload of %s' % (name, types))
                 if issubclass(expected_type_, ChromeTypeBase):
-                    result[name] = expected_type_(**val)
+                    if many:
+                        result[name] = [expected_type_(**v) for v in val]
+                    else:
+                        result[name] = expected_type_(**val)
                 elif re.match(r'.*Id$', name) and isinstance(val, str):
-                    result[name] = expected_type_(val)
+                    if many:
+                        result[name] = [expected_type_(v) for v in val]
+                    else:
+                        result[name] = expected_type_(val)
                 elif not isinstance(val, expected_type_):
                     raise ValueError('%s is not expected type %s, instead is %s' % (val, expected_type_, val))
             for rn, rv in types_.items():
                 if not rv.get('optional', False):
                     raise ValueError('expected payload param "%s" is missing!' % rn)
             return result
+
         return convert
 
 
@@ -95,7 +106,6 @@ def json_to_event(payload) -> BaseEvent:
 
 
 class ChromeTypeBase:
-
     def to_dict(self):
         return self.__dict__
 

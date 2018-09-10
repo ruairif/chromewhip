@@ -1,56 +1,61 @@
 import asyncio
 import functools
+import json
 import logging
 
 from bs4 import BeautifulSoup
 from aiohttp import web
 
+from chromewhip.commands import Splash
 from chromewhip.protocol import page, emulation, browser, dom, runtime
 
 BS = functools.partial(BeautifulSoup, features="lxml")
 
 log = logging.getLogger('chromewhip.views')
 
-async def _go(request: web.Request):
 
+async def get_image(request, tab, format, **kwargs):
+    render_all = tab.get_bool('render_all')
+    width, height = request.query.get('viewport', '1024x768').split('x')[:2]
+    x, y = (0, 0) if render_all else (None, None)
+    return (
+        await tab.screenshot(
+            x=x, y=y, width=width, height=height, format=format
+        )
+    )['body']
+
+
+async def _go(request: web.Request):
     js_profiles = request.app['js-profiles']
-    c = request.app['chrome-driver']
 
     url = request.query.get('url')
     if not url:
-        return web.HTTPBadRequest(reason='no url query param provided')  # TODO: match splash reply
+        return web.HTTPBadRequest(
+            reason='no url query param provided'
+        )  # TODO: match splash reply
 
     wait_s = float(request.query.get('wait', 0))
-
-    raw_viewport = request.query.get('viewport', '1024x768')
-    parts = raw_viewport.split('x')
-    width = int(parts[0])
-    height = int(parts[1])
 
     js_profile_name = request.query.get('js', None)
     if js_profile_name:
         profile = js_profiles.get(js_profile_name)
         if not profile:
-            return web.HTTPBadRequest(reason='profile name is incorrect')  # TODO: match splash
+            return web.HTTPBadRequest(
+                reason='profile name is incorrect'
+            )  # TODO: match splash
 
     # TODO: potentially validate and verify js source for errors and security concerrns
     js_source = request.query.get('js_source', None)
 
-    await c.connect()
-    tab = c.tabs[0]
-    cmd = page.Page.setDeviceMetricsOverride(width=width,
-                                             height=height,
-                                             deviceScaleFactor=0.0,
-                                             mobile=False)
-    await tab.send_command(cmd)
-    await tab.enable_page_events()
+    tab = Splash(request)
+    await tab.initialize()
     await tab.go(url)
     await asyncio.sleep(wait_s)
     if js_profile_name:
-        await tab.evaluate(js_profiles[js_profile_name])
+        await tab.evaljs(js_profiles[js_profile_name])
 
     if js_source:
-        await tab.evaluate(js_source)
+        await tab.evaljs(js_source)
 
     return tab
 
@@ -65,46 +70,70 @@ async def render_png(request: web.Request):
     # https://splash.readthedocs.io/en/stable/api.html#render-png
     tab = await _go(request)
 
-    should_render_all = True if request.query.get('render_all', False) == '1' else False
+    output = get_image(request, tab, 'png')
+    return web.Response(body=output, content_type='image/png')
 
-    if not should_render_all:
-        data = await tab.screenshot()
-        return web.Response(body=data, content_type='image/png')
 
-    if should_render_all:
-        raw_viewport = request.query.get('viewport', '1024x768')
-        parts = raw_viewport.split('x')
-        width = int(parts[0])
-        height = int(parts[1])
-        cmd = page.Page.setDeviceMetricsOverride(width=int(width),
-                                                 height=int(height),
-                                                 deviceScaleFactor=0.0,
-                                                 mobile=False)
-        await tab.send_command(cmd)
+async def render_jpeg(request: web.Request):
+    # https://splash.readthedocs.io/en/stable/api.html#render-png
+    tab = await _go(request)
 
-        # model numbers affected by device metrics, so needs to come after
-        res = await tab.send_command(dom.DOM.getDocument())
-        doc_node_id = res['ack']['result']['root'].nodeId
-        res = await tab.send_command(dom.DOM.querySelector(selector='body', nodeId=doc_node_id))
-        body_node_id = res['ack']['result']['nodeId']
-        res = await tab.send_command(dom.DOM.getBoxModel(nodeId=body_node_id))
-        full_height = res['ack']['result']['model'].height
-        log.debug('full_height = %s' % full_height)
+    output = get_image(request, tab, 'jpeg')
+    return web.Response(body=output, content_type='image/jpeg')
 
-        offset = 0
-        import base64
-        from PIL import Image
-        from io import BytesIO
-        full_image = Image.new('RGB', (int(width), int(full_height)))
-        delta = int(height)
-        while offset < full_height + 1:  # TODO: cut+paste to exact dimensions
-            await tab.send_command(runtime.Runtime.evaluate('window.scrollTo(0, %s)' % offset))
-            result = await tab.send_command(page.Page.captureScreenshot(format='png', fromSurface=False))
-            base64_data = result['ack']['result']['data']
-            snapshot = Image.open(BytesIO(base64.b64decode(base64_data)))
-            full_image.paste(snapshot, (0, offset))
-            offset += delta
-        output = BytesIO()
-        full_image.save(output, format='png')
-        return web.Response(body=output.getvalue(), content_type='image/png')
 
+async def render_json(request: web.Request):
+    # https://splash.readthedocs.io/en/stable/api.html#render-png
+    tab = await _go(request)
+
+    response = {
+        'url': (await tab.evaljs('window.location.href'))['body'],
+        'geometry': [0, 0] + list(tab.viewport_size),
+        'requestedUrl': request.query.get('url'),
+        'title': (await tab.evaljs('document.title'))['body'],
+    }
+    if tab.get_bool('html'):
+        response['html'] = (await tab.html())['body']
+    if tab.get_bool('png'):
+        response['png'] = await get_image(request, tab, 'png', b64=True)
+    if tab.get_bool('jpeg'):
+        response['jpeg'] = await get_image(request, tab, 'jpeg', b64=True)
+    if tab.get_bool('cookies'):
+        response['cookies'] = (await tab.cookies())['body']
+    if tab.get_bool('iframes'):
+        pass
+    if tab.get_bool('har'):
+        pass
+    if tab.get_bool('console'):
+        response['console'] = (await tab.console())['body']
+    if tab.get_bool('history'):
+        response['history'] = (await tab.history())['body']
+    return web.Response(
+        body=json.dumps(response), content_type='application/json'
+    )
+
+
+async def stream_json(request: web.Request):
+    from chromewhip.streaming import SSEResponse
+    from aiohttp_sse import sse_response
+
+    commands = await request.json()
+    url = request.query.get('url') or commands.get('url')
+    if not url:
+        return web.HTTPBadRequest(reason='no url provided')
+    script = commands.get('script')
+    if not script:
+        return web.HTTPBadRequest(reason='no script provided')
+    wait_s = float(request.query.get('wait') or commands.get('wait') or 0)
+    try:
+        async with sse_response(request, response_cls=SSEResponse) as response:
+            tab = Splash(request, response)
+            await tab.initialize()
+            await tab.go(url)
+            await asyncio.sleep(wait_s)
+            await tab.run(script)
+    except:
+        import traceback
+
+        traceback.print_exc()
+    return response
