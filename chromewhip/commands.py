@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import keyword
 import textwrap
 
 from chromewhip.protocol import input
@@ -10,6 +11,7 @@ class Splash:
     def __init__(self, request, response=None):
         self.response = response
         self.request = request
+        self._selector_queue = []
 
     async def initialize(self):
         driver = self.request.app['chrome-driver']
@@ -110,9 +112,20 @@ class Splash:
         for _ in range(count):
             await self.run(script)
 
+    async def while_(self, selector, start=1, script=None, index='index'):
+        full_selector = selector.format(index=start)
+        while await self.check_selector_exists(full_selector):
+            self._selector_queue.append(full_selector)
+            await self.run(script)
+            start += 1
+            full_selector = selector.format(index=start)
+
     async def run(self, args):
         for command in args:
-            method = getattr(self, command['action'])
+            action = command['action']
+            if keyword.iskeyword(action):
+                action = '{}_'.format(action)
+            method = getattr(self, action)
             await method(**command.get('args', {}))
 
     async def send_response(self, data=None):
@@ -130,7 +143,7 @@ class Splash:
         return response
 
     async def click(self, css_selector=None, x=None, y=None):
-        if css_selector:
+        if css_selector or not (x and y):
             x, y = await self.click_target(css_selector, x, y)
         await self.dispatch_mouse_event(x, y, 'mouseMoved')
         await self.dispatch_mouse_event(x, y, 'mousePressed')
@@ -138,17 +151,17 @@ class Splash:
         await self.dispatch_mouse_event(x, y, 'mouseReleased')
 
     async def hover(self, css_selector=None, x=None, y=None):
-        if css_selector:
+        if css_selector or not (x and y):
             x, y = await self.click_target(css_selector, x, y)
         await self.dispatch_mouse_event(x, y, 'mouseMoved')
 
     async def press(self, css_selector=None, x=None, y=None):
-        if css_selector:
+        if css_selector or not (x and y):
             x, y = await self.click_target(css_selector, x, y)
         await self.dispatch_mouse_event(x, y, 'mousePressed')
 
-    async def mrelease(self, css_selector=None, x=None, y=None):
-        if css_selector:
+    async def release(self, css_selector=None, x=None, y=None):
+        if css_selector or not (x and y):
             x, y = await self.click_target(css_selector, x, y)
         await self.dispatch_mouse_event(x, y, 'mouseReleased')
 
@@ -179,7 +192,21 @@ class Splash:
         )
         return json.loads(res)
 
+    async def check_selector_exists(self, selector):
+        res = await self.evaluate(
+            textwrap.dedent(
+                f'''
+                (function() {{
+                    let elem = document.querySelector("{selector}");
+                    return JSON.stringify(!!elem);
+                }})()'''
+            )
+        )
+        return json.loads(res)
+
     async def click_target(self, selector, dx=None, dy=None):
+        if not selector:
+            selector = self._selector_queue[-1]
         dimensions = await self.get_element_dimensions(selector)
         if not dimensions:
             return None, None
