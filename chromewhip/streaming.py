@@ -5,6 +5,8 @@ from aiohttp_sse import EventSourceResponse
 
 
 class SSEResponse(EventSourceResponse):
+    DEFAULT_PING_INTERVAL = 60 * 15  # 15 minutes
+
     async def prepare(self, request):
         """Prepare for streaming and send HTTP headers.
         :param request: regular aiohttp.web.Request.
